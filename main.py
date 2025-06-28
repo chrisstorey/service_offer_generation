@@ -2,6 +2,8 @@ from fastapi import FastAPI, Request, Depends, HTTPException, Form, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from markupsafe import Markup, escape
+
 from pydantic import ValidationError
 from typing import List, Optional
 import uuid # For new org/loc IDs if not provided via form explicitly
@@ -17,6 +19,11 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Setup Jinja2 templates
 templates = Jinja2Templates(directory="templates")
+
+def nl2br(value):
+    return Markup(escape(value).replace('\n', '<br>\n'))
+
+templates.env.filters['nl2br'] = nl2br
 
 # --- Dependency for Forms (FastAPI doesn't natively parse Pydantic models from HTML forms directly for complex nested models) ---
 # We will handle form parsing manually in each endpoint or use a simpler approach for this example.
