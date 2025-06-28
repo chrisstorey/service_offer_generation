@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+
+{% block title %}{% if offer %}Edit Offer: {{ offer.name }}{% else %}Create New Offer{% endif %}{% endblock %}
+
+{% block sidebar %}
+    <a href="{{ url_for('list_offers_view') }}" class="btn btn-outline-secondary mb-3">&laquo; Back to List</a>
+    {% if offer %}
+    <a href="{{ url_for('offer_detail_view', offer_id=offer.id) }}" class="btn btn-outline-info mb-3">View Offer Details</a>
+    {% endif %}
+    <h5>Form Help</h5>
+    <p class="small text-muted">
+        Fill in the details for the service offer. Fields marked with * are required.
+        For Organisation and Location, you can select existing entries or provide IDs.
+        Creating new Organisations/Locations directly from this form is simplified;
+        ensure the selected IDs exist or that your backend handles creation if IDs are omitted and full objects are intended.
+    </p>
+{% endblock %}
+
+{% block content %}
+    <h2>{% if offer %}Edit Offer: {{ offer.name }}{% else %}Create New Offer{% endif %}</h2>
+    <hr>
+
+    {% if errors %}
+        <div class="alert alert-danger">
+            <strong>Please correct the following errors:</strong>
+            <ul>
+                {% for error in errors %}
+                    <li>
+                        {% if error.loc %}
+                           Field '{{ error.loc|join('.') }}':
+                        {% endif %}
+                        {{ error.msg }}
+                    </li>
+                {% endfor %}
+            </ul>
+        </div>
+    {% endif %}
+
+    <form method="post" action="{{ form_action_url }}">
+        {# Basic Info #}
+        <fieldset class="mb-3">
+            <legend>Basic Information</legend>
+            <div class="mb-3">
+                <label for="name" class="form-label">Offer Name *</label>
+                <input type="text" class="form-control" id="name" name="name" value="{{ offer.name if offer else '' }}" required>
+            </div>
+            <div class="mb-3">
+                <label for="service_id" class="form-label">Service ID (Internal)*</label>
+                <input type="text" class="form-control" id="service_id" name="service_id" value="{{ offer.service_id if offer else '' }}" required>
+                <div class="form-text">An internal identifier for the broader service this offer belongs to.</div>
+            </div>
+            <div class="mb-3">
+                <label for="description" class="form-label">Description</label>
+                <textarea class="form-control" id="description" name="description" rows="3">{{ offer.description if offer else '' }}</textarea>
+            </div>
+            <div class="mb-3">
+                <label for="url" class="form-label">URL</label>
+                <input type="url" class="form-control" id="url" name="url" value="{{ offer.url if offer else '' }}">
+            </div>
+            <div class="row">
+                <div class="col-md-6 mb-3">
+                    <label for="type" class="form-label">Service Type *</label>
+                    <input type="text" class="form-control" id="type" name="type" value="{{ offer.type if offer else '' }}" required list="service_type_options">
+                    <datalist id="service_type_options">
+                        {% for stype in distinct_service_types if distinct_service_types %} {# distinct_service_types might not be passed to this template yet #}
+                            <option value="{{ stype }}">
+                        {% else %}
+                            <option value="vocational_training">
+                            <option value="education">
+                            <option value="financial_advice">
+                            <option value="employment_support">
+                        {% endfor %}
+                    </datalist>
+                </div>
+                <div class="col-md-6 mb-3">
+                    <label for="status" class="form-label">Status *</label>
+                    <select class="form-select" id="status" name="status" required>
+                        <option value="active" {% if offer and offer.status == 'active' %}selected{% endif %}>Active</option>
+                        <option value="inactive" {% if offer and offer.status == 'inactive' %}selected{% endif %}>Inactive</option>
+                        <option value="pending" {% if offer and offer.status == 'pending' %}selected{% endif %}>Pending</option>
+                    </select>
+                </div>
+            </div>
+        </fieldset>
+
+        {# Delivery & Support #}
+        <fieldset class="mb-3">
+            <legend>Delivery & Support</legend>
+            <div class="form-check form-switch mb-2">
+                <input class="form-check-input" type="checkbox" id="in_person" name="in_person" value="true" {% if offer and offer.in_person %}checked{% endif %}>
+                <label class="form-check-label" for="in_person">In-Person Delivery</label>
+            </div>
+            <div class="form-check form-switch mb-2">
+                <input class="form-check-input" type="checkbox" id="remote" name="remote" value="true" {% if offer and offer.remote %}checked{% endif %}>
+                <label class="form-check-label" for="remote">Remote Delivery</label>
+            </div>
+            <div class="form-check form-switch mb-2">
+                <input class="form-check-input" type="checkbox" id="interpretation_services" name="interpretation_services" value="true" {% if offer and offer.interpretation_services %}checked{% endif %}>
+                <label class="form-check-label" for="interpretation_services">Interpretation Services</label>
+            </div>
+            <div class="form-check form-switch mb-2">
+                <input class="form-check-input" type="checkbox" id="phone_support" name="phone_support" value="true" {% if offer and offer.phone_support %}checked{% endif %}>
+                <label class="form-check-label" for="phone_support">Phone Support</label>
+            </div>
+            <div class="form-check form-switch mb-3">
+                <input class="form-check-input" type="checkbox" id="online_support" name="online_support" value="true" {% if offer and offer.online_support %}checked{% endif %}>
+                <label class="form-check-label" for="online_support">Online Support</label>
+            </div>
+        </fieldset>
+
+        {# Cost, Eligibility, Areas, Schedule - Simplified for form #}
+        {# For a full implementation, these would likely be dynamic sections (add/remove items) #}
+        <fieldset class="mb-3">
+            <legend>Details</legend>
+            <div class="mb-3">
+                <label class="form-label">Cost Option (Primary)</label>
+                <div class="row">
+                    <div class="col-md-4">
+                        <input type="number" step="0.01" class="form-control" name="cost_option_amount" placeholder="Amount" value="{{ offer.cost_options[0].amount if offer and offer.cost_options else '0.00' }}">
+                    </div>
+                    <div class="col-md-4">
+                        <input type="text" class="form-control" name="cost_option_option" placeholder="Option (e.g., No Cost)" value="{{ offer.cost_options[0].option if offer and offer.cost_options else 'No Cost' }}">
+                    </div>
+                    <div class="col-md-4">
+                        <input type="text" class="form-control" name="cost_option_amount_description" placeholder="Description" value="{{ offer.cost_options[0].amount_description if offer and offer.cost_options else 'Free for eligible individuals' }}">
+                    </div>
+                </div>
+                 <div class="form-text">Simplified: handles one cost option.</div>
+            </div>
+
+            <div class="mb-3">
+                <label for="eligibility" class="form-label">Eligibility</label>
+                <input type="text" class="form-control" id="eligibility" name="eligibility" value="{{ offer.eligibility if offer else '' }}">
+            </div>
+
+            <div class="mb-3">
+                <label for="service_area_name" class="form-label">Service Area (Primary) *</label>
+                <input type="text" class="form-control" id="service_area_name" name="service_area_name" value="{{ offer.service_areas[0].name if offer and offer.service_areas else '' }}" required>
+                <div class="form-text">Simplified: handles one service area.</div>
+            </div>
+            <div class="mb-3">
+                <label for="schedule_description" class="form-label">Schedule Description</label>
+                <input type="text" class="form-control" id="schedule_description" name="schedule_description" value="{{ offer.service_schedules[0].description if offer and offer.service_schedules else 'Regular weekly operating hours.' }}">
+                <div class="form-text">Simplified: handles one schedule description. Other schedule fields (times, dates) are not in this basic form.</div>
+            </div>
+        </fieldset>
+
+        {# Organisation & Location #}
+        <fieldset class="mb-3">
+            <legend>Organisation & Location</legend>
+            <div class="row">
+                <div class="col-md-6 mb-3">
+                    <label for="organisation_id" class="form-label">Organisation (Select Existing)</label>
+                    <select class="form-select" id="organisation_id" name="organisation_id">
+                        <option value="">-- Select Organisation --</option>
+                        {% for org_item in all_organisations %}
+                        <option value="{{ org_item.id }}" {% if offer and offer.organisation_id == org_item.id or (offer and offer.organisation and offer.organisation.id == org_item.id) %}selected{% endif %}>
+                            {{ org_item.name }} (ID: {{ org_item.id[:8] }}...)
+                        </option>
+                        {% endfor %}
+                    </select>
+                     <div class="form-text">If not selected, and not creating new, this might cause an error.</div>
+                </div>
+                <div class="col-md-6 mb-3">
+                    <label for="location_id" class="form-label">Location (Select Existing)</label>
+                    <select class="form-select" id="location_id" name="location_id">
+                        <option value="">-- Select Location --</option>
+                        {% for loc_item in all_locations %}
+                        <option value="{{ loc_item.id }}" {% if offer and offer.location_id == loc_item.id or (offer and offer.location and offer.location.id == loc_item.id) %}selected{% endif %}>
+                            {{ loc_item.name }} - {{ loc_item.city }} (ID: {{ loc_item.id[:8] }}...)
+                        </option>
+                        {% endfor %}
+                    </select>
+                    <div class="form-text">If not selected, and not creating new, this might cause an error.</div>
+                </div>
+            </div>
+            {# Add fields for creating NEW organisation/location if desired #}
+            {# <p class="text-muted small">Alternatively, provide details for a new Organisation/Location (not fully implemented in this form).</p> #}
+        </fieldset>
+
+        <hr>
+        <button type="submit" class="btn btn-primary">{% if offer %}Save Changes{% else %}Create Offer{% endif %}</button>
+        <a href="{{ url_for('list_offers_view') if not offer else url_for('offer_detail_view', offer_id=offer.id) }}" class="btn btn-secondary">Cancel</a>
+    </form>
+{% endblock %}
+
+{% block scripts %}
+{{ super() }}
+<script>
+    // Basic client-side check for required fields (though server-side validation is key)
+    // document.querySelector('form').addEventListener('submit', function(event) {
+    //     let name = document.getElementById('name').value;
+    //     if (!name) {
+    //         alert('Offer Name is required.');
+    //         event.preventDefault();
+    //     }
+    // });
+</script>
+{% endblock %}
