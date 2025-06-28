@@ -1,0 +1,131 @@
+{% extends "base.html" %}
+
+{% block title %}{{ offer.name }}{% endblock %}
+
+{% block sidebar %}
+    <a href="{{ url_for('list_offers_view') }}" class="btn btn-outline-secondary mb-3">&laquo; Back to List</a>
+    <a href="{{ url_for('edit_offer_form', offer_id=offer.id) }}" class="btn btn-warning mb-3 d-block">Edit Offer</a>
+    <form action="{{ url_for('delete_offer_action', offer_id=offer.id) }}" method="post" class="d-block mb-3">
+        <button type="submit" class="btn btn-danger w-100" onclick="return confirm('Are you sure you want to delete this offer?');">Delete Offer</button>
+    </form>
+    <h5>Offer Quick Info</h5>
+    <p><strong>Type:</strong> {{ offer.type|title }}</p>
+    <p><strong>Organisation:</strong> {{ offer.organisation.name }}</p>
+    <p><strong>Location:</strong> {{ offer.location.name }}, {{ offer.location.city }}</p>
+{% endblock %}
+
+{% block content %}
+    <h2>{{ offer.name }}</h2>
+    <hr>
+
+    <div class="row">
+        <div class="col-md-7">
+            <h4>Details</h4>
+            <p><strong>Description:</strong> {{ offer.description | nl2br }}</p>
+            <p><strong>Eligibility:</strong> {{ offer.eligibility }}</p>
+            <p><strong>Status:</strong> <span class="badge bg-{% if offer.status == 'active' %}success{% else %}secondary{% endif %}">{{ offer.status|title }}</span></p>
+            <p><strong>URL:</strong> <a href="{{ offer.url }}" target="_blank">{{ offer.url }}</a></p>
+
+            <h5>Delivery Options:</h5>
+            <ul>
+                <li>In-Person: {% if offer.in_person %}✔️{% else %}❌{% endif %}</li>
+                <li>Remote: {% if offer.remote %}✔️{% else %}❌{% endif %}</li>
+                <li>Interpretation Services: {% if offer.interpretation_services %}✔️{% else %}❌{% endif %}</li>
+                <li>Phone Support: {% if offer.phone_support %}✔️{% else %}❌{% endif %}</li>
+                <li>Online Support: {% if offer.online_support %}✔️{% else %}❌{% endif %}</li>
+            </ul>
+
+            <h5>Cost Options:</h5>
+            {% if offer.cost_options %}
+                <ul>
+                {% for cost in offer.cost_options %}
+                    <li>{{ cost.option }}: £{{ "%.2f"|format(cost.amount) }} ({{ cost.amount_description }})</li>
+                {% endfor %}
+                </ul>
+            {% else %}
+                <p>No cost information available.</p>
+            {% endif %}
+
+            <h5>Service Areas:</h5>
+            {% if offer.service_areas %}
+                <ul>
+                {% for area in offer.service_areas %}
+                    <li>{{ area.name }}</li>
+                {% endfor %}
+                </ul>
+            {% else %}
+                <p>No service areas specified.</p>
+            {% endif %}
+
+            <h5>Schedule:</h5>
+            {% if offer.service_schedules %}
+                <ul>
+                {% for schedule in offer.service_schedules %}
+                    <li>
+                        {{ schedule.description }}
+                        {% if schedule.opens_at and schedule.closes_at %}
+                            ({{ schedule.opens_at.strftime('%H:%M') }} - {{ schedule.closes_at.strftime('%H:%M') }})
+                        {% endif %}
+                        {% if schedule.valid_from and schedule.valid_to %}
+                            (From: {{ schedule.valid_from.strftime('%Y-%m-%d') }} To: {{ schedule.valid_to.strftime('%Y-%m-%d') }})
+                        {% endif %}
+                        {% if schedule.valid_for_weekdays %}
+                            Days: {{ schedule.valid_for_weekdays|join(', ') }}
+                        {% endif %}
+                    </li>
+                {% endfor %}
+                </ul>
+            {% else %}
+                <p>No schedule information available.</p>
+            {% endif %}
+        </div>
+        <div class="col-md-5">
+            <h4>Location</h4>
+            <address>
+                <strong>{{ offer.location.name }}</strong><br>
+                {{ offer.location.address_1 }}<br>
+                {{ offer.location.city }}, {{ offer.location.postal_code }}
+            </address>
+            {% if offer.location.accessibility %}
+            <p><strong>Accessibility:</strong> {{ offer.location.accessibility|join(', ') }}</p>
+            {% endif %}
+
+            <h5>Map</h5>
+            <div id="map"></div>
+        </div>
+    </div>
+
+    <hr>
+    <h4>Organisation Details</h4>
+    <p><strong>Name:</strong> {{ offer.organisation.name }}</p>
+    <p><strong>Description:</strong> {{ offer.organisation.description }}</p>
+    <p><strong>Contact Phone:</strong> {{ offer.organisation.contact_phone }}</p>
+    <p><strong>Website:</strong> <a href="{{ offer.organisation.url }}" target="_blank">{{ offer.organisation.url }}</a></p>
+
+{% endblock %}
+
+{% block scripts %}
+{{ super() }}
+{% if offer.location.latitude and offer.location.longitude %}
+<script>
+    document.addEventListener('DOMContentLoaded', function () {
+        var map = L.map('map').setView([{{ offer.location.latitude }}, {{ offer.location.longitude }}], 15);
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+
+        L.marker([{{ offer.location.latitude }}, {{ offer.location.longitude }}]).addTo(map)
+            .bindPopup('<b>{{ offer.location.name|e }}</b><br>{{ offer.location.address_1|e }}, {{ offer.location.city|e }}')
+            .openPopup();
+    });
+</script>
+{% else %}
+<script>
+    document.addEventListener('DOMContentLoaded', function () {
+        document.getElementById('map').innerHTML = '<p class="text-muted">Map data not available for this location.</p>';
+    });
+</script>
+{% endif %}
+{% endblock %}
