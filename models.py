@@ -107,20 +107,9 @@ class Offer(OfferBase):
     organisation: Organisation # Full embedded Organisation object
     location: Location       # Full embedded Location object
 
-    class Config:
-        orm_mode = True # Kept for potential future ORM use, though not strictly needed for JSON files
-        # Pydantic v2 uses model_config instead of Config class
-        # Reverting to Config for broader compatibility if any Pydantic v1 features are accidentally used.
-        # For Pydantic v2, this would be:
-        # model_config = {
-        #     "from_attributes": True
-        # }
-        # However, from_attributes is the new name for orm_mode.
-        # Let's stick to orm_mode as it's more familiar in this context.
-        # Actually, for Pydantic V2, it should be `from_attributes = True`
-        # but since we're not using an ORM, this might not be strictly necessary.
-        # The primary goal is to ensure data validation and serialization.
-        pass
+    model_config = {
+        "from_attributes": True
+    }
 
 # Example of how a full Offer might look in the database (offers.json)
 # This is just for reference, not part of the importable models.
