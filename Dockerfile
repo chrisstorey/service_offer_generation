@@ -7,7 +7,7 @@ ENV PYTHONUNBUFFERED 1
 
 # System dependencies for psycopg2 and potentially other libraries
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libpq-dev gcc && \
+    apt-get install -y --no-install-recommends libpq-dev gcc postgresql-client && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
