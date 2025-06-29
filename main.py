@@ -1,37 +1,31 @@
-from fastapi import FastAPI, Request, Depends, HTTPException, Form, status
+from fastapi import FastAPI, Request, HTTPException, Form, status
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
+# from fastapi.staticfiles import StaticFiles # Not currently used
 from fastapi.templating import Jinja2Templates
 from markupsafe import Markup, escape
-
-from pydantic import ValidationError
-from typing import List, Optional
+from datetime import time, date
+import json
 import uuid # For new org/loc IDs if not provided via form explicitly
 
-# Assuming models.py and data_handler.py are in the same directory
+from pydantic import ValidationError
+from typing import List, Optional, Any
+
 import models
 import data_handler
 
-app = FastAPI(title="Service Offers CRUD App")
+app = FastAPI(title="Service Offers CRUD App with PostGIS")
 
-# Mount static files directory (for CSS, JS, images)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# app.mount("/static", StaticFiles(directory="static"), name="static") # If you add static files
 
-# Setup Jinja2 templates
 templates = Jinja2Templates(directory="templates")
 
-def nl2br(value):
+def nl2br(value: Optional[str]) -> Markup:
+    if value is None: return Markup("")
     return Markup(escape(value).replace('\n', '<br>\n'))
 
 templates.env.filters['nl2br'] = nl2br
-
-# --- Dependency for Forms (FastAPI doesn't natively parse Pydantic models from HTML forms directly for complex nested models) ---
-# We will handle form parsing manually in each endpoint or use a simpler approach for this example.
-# For complex forms, using Pydantic models directly with `request.form()` requires careful handling.
-
-# --- Helper to get base URL for redirects ---
-def get_base_url(request: Request) -> str:
-    return str(request.base_url)
+templates.env.globals['models'] = models
+templates.env.globals['json'] = json # Make json available for dumping lists in forms
 
 # --- Endpoints ---
 
@@ -42,14 +36,16 @@ async def list_offers_view(
     city: Optional[str] = None,
     in_person: Optional[bool] = None,
     remote: Optional[bool] = None,
-    organisation_name: Optional[str] = None
+    organisation_name: Optional[str] = None,
+    # PostGIS specific query params (example)
+    current_lat: Optional[float] = None,
+    current_lon: Optional[float] = None,
+    radius_km: Optional[float] = None
 ):
     offers = data_handler.load_offers(
-        service_type=service_type,
-        city=city,
-        in_person=in_person,
-        remote=remote,
-        organisation_name=organisation_name
+        service_type=service_type, city=city, in_person=in_person, remote=remote,
+        organisation_name=organisation_name,
+        current_lat=current_lat, current_lon=current_lon, radius_km=radius_km
     )
     distinct_cities = data_handler.get_distinct_cities()
     distinct_service_types = data_handler.get_distinct_service_types()
@@ -58,17 +54,13 @@ async def list_offers_view(
     return templates.TemplateResponse(
         "offers_list.html",
         {
-            "request": request,
-            "offers": offers,
-            "distinct_cities": distinct_cities,
-            "distinct_service_types": distinct_service_types,
+            "request": request, "offers": offers,
+            "distinct_cities": distinct_cities, "distinct_service_types": distinct_service_types,
             "distinct_organisations": distinct_organisations,
-            "current_filters": { # Pass current filters back to the template to repopulate form
-                "service_type": service_type,
-                "city": city,
-                "in_person": in_person,
-                "remote": remote,
-                "organisation_name": organisation_name
+            "current_filters": {
+                "service_type": service_type, "city": city, "in_person": in_person,
+                "remote": remote, "organisation_name": organisation_name,
+                "current_lat": current_lat, "current_lon": current_lon, "radius_km": radius_km
             }
         },
     )
@@ -77,108 +69,147 @@ async def list_offers_view(
 async def create_offer_form(request: Request):
     all_organisations = data_handler.get_all_organisations()
     all_locations = data_handler.get_all_locations()
-    distinct_service_types = data_handler.get_distinct_service_types() # Added for datalist
+    distinct_service_types = data_handler.get_distinct_service_types()
     return templates.TemplateResponse(
         "offer_form.html",
         {
-            "request": request,
-            "offer": None, # No existing offer data for a new form
-            "all_organisations": all_organisations,
-            "all_locations": all_locations,
-            "distinct_service_types": distinct_service_types, # Pass to template
+            "request": request, "offer": None,
+            "all_organisations": all_organisations, "all_locations": all_locations,
+            "distinct_service_types": distinct_service_types,
             "form_action_url": app.url_path_for("create_offer_action")
         }
     )
 
+def parse_form_schedule(
+    schedule_description: Optional[str],
+    schedule_opens_at_str: Optional[str],
+    schedule_closes_at_str: Optional[str],
+    schedule_valid_from_str: Optional[str],
+    schedule_valid_to_str: Optional[str],
+    schedule_weekdays_json_str: Optional[str]
+) -> Optional[models.ServiceSchedule]:
+
+    # Check if any schedule field has a meaningful value
+    if not any(filter(None, [
+        schedule_description, schedule_opens_at_str, schedule_closes_at_str,
+        schedule_valid_from_str, schedule_valid_to_str,
+        schedule_weekdays_json_str and schedule_weekdays_json_str != "[]" # Empty list string is not meaningful alone
+    ])):
+        return None
+
+    weekdays_list: List[str] = []
+    if schedule_weekdays_json_str:
+        try:
+            parsed_json = json.loads(schedule_weekdays_json_str)
+            if isinstance(parsed_json, list):
+                weekdays_list = [str(item) for item in parsed_json if isinstance(item, (str, int, float))] # Ensure items are strings
+        except json.JSONDecodeError:
+            pass # Keep weekdays_list empty
+
+    return models.ServiceSchedule(
+        description=schedule_description,
+        opens_at=time.fromisoformat(schedule_opens_at_str) if schedule_opens_at_str else None,
+        closes_at=time.fromisoformat(schedule_closes_at_str) if schedule_closes_at_str else None,
+        valid_from=date.fromisoformat(schedule_valid_from_str) if schedule_valid_from_str else None,
+        valid_to=date.fromisoformat(schedule_valid_to_str) if schedule_valid_to_str else None,
+        valid_for_weekdays=weekdays_list
+    )
+
 @app.post("/offers", name="create_offer_action")
 async def create_offer_action(request: Request,
-    # Form fields - must match the names in your HTML form
-    service_id: str = Form(...),
-    name: str = Form(...),
-    description: Optional[str] = Form(None),
-    url: Optional[str] = Form(None), # Pydantic HttpUrl will validate
-    status: str = Form("active"),
-    type: str = Form(...),
-    in_person: bool = Form(False),
-    remote: bool = Form(False),
-    interpretation_services: bool = Form(False),
-    phone_support: bool = Form(False),
-    online_support: bool = Form(False),
-    # CostOptions - simplified for form handling: assume one cost option for now
-    cost_option_amount: float = Form(0.0),
-    cost_option_amount_description: Optional[str] = Form("Free for eligible individuals"),
-    cost_option_option: str = Form("No Cost"),
-    eligibility: Optional[str] = Form(None),
-    # ServiceAreas - simplified: assume one service area
-    service_area_name: str = Form(...),
-    # ServiceSchedules - simplified: assume one schedule
-    # For simplicity, not taking all schedule fields, can be expanded
-    schedule_description: Optional[str] = Form("Regular weekly operating hours."),
-    # Organisation and Location: either select existing or create new
-    # For simplicity, this example will focus on selecting existing if IDs are provided.
-    # Creating new org/loc via form would require more fields.
-    organisation_id: Optional[str] = Form(None), # ID of existing org
-    location_id: Optional[str] = Form(None), # ID of existing loc
-    # If creating new, these would be needed:
-    # new_organisation_name: Optional[str] = Form(None),
-    # new_location_name: Optional[str] = Form(None),
-    # ... other fields for new org/loc
+    service_id: str = Form(...), name: str = Form(...), description: Optional[str] = Form(None),
+    url: Optional[str] = Form(None), status: str = Form("active"), type: str = Form(...),
+    in_person: bool = Form(False), remote: bool = Form(False),
+    interpretation_services: bool = Form(False), phone_support: bool = Form(False),
+    online_support: bool = Form(False), eligibility: Optional[str] = Form(None),
+    organisation_id: Optional[str] = Form(None),
+    new_organisation_name: Optional[str] = Form(None),
+    new_organisation_description: Optional[str] = Form(None),
+    new_organisation_url: Optional[str] = Form(None),
+    new_organisation_contact_phone: Optional[str] = Form(None),
+    location_id: Optional[str] = Form(None),
+    new_location_name: Optional[str] = Form(None),
+    new_location_address_1: Optional[str] = Form(None),
+    new_location_city: Optional[str] = Form(None),
+    new_location_postal_code: Optional[str] = Form(None),
+    new_location_latitude: Optional[float] = Form(None),
+    new_location_longitude: Optional[float] = Form(None),
+    new_location_accessibility_json: Optional[str] = Form("[]"),
+    cost_option_amount: Optional[float] = Form(None),
+    cost_option_amount_description: Optional[str] = Form(None),
+    cost_option_option: Optional[str] = Form(None),
+    service_area_name: Optional[str] = Form(None),
+    schedule_description: Optional[str] = Form(None),
+    schedule_opens_at: Optional[str] = Form(None), schedule_closes_at: Optional[str] = Form(None),
+    schedule_valid_from: Optional[str] = Form(None), schedule_valid_to: Optional[str] = Form(None),
+    schedule_weekdays_json: Optional[str] = Form("[]")
 ):
-    try:
-        cost_options_data = [models.CostOption(amount=cost_option_amount, amount_description=cost_option_amount_description, option=cost_option_option)]
-        service_areas_data = [models.ServiceArea(name=service_area_name)]
-        # Simplified schedule
-        schedules_data = [models.ServiceSchedule(description=schedule_description)]
-
-        # This is a simplified way to handle org/loc. A real form would be more complex.
-        # For this example, we primarily rely on selecting existing org/loc by ID.
-        # If you wanted to create new org/loc from the same form, you'd need more fields
-        # and logic to decide whether to use existing_org_id or new_org_fields.
-
-        # For now, we'll assume that if organisation_id and location_id are provided, they are used.
-        # If not, the data_handler.add_offer would need to handle potential inline creation
-        # based on offer_data.organisation and offer_data.location being populated.
-        # The current OfferCreate model allows for this.
-
-        offer_create_data = models.OfferCreate(
-            service_id=service_id, name=name, description=description, url=url or None, status=status, type=type,
-            in_person=in_person, remote=remote, interpretation_services=interpretation_services,
-            phone_support=phone_support, online_support=online_support,
-            cost_options=cost_options_data, eligibility=eligibility, service_areas=service_areas_data,
-            service_schedules=schedules_data,
-            organisation_id=organisation_id, # Pass the ID
-            location_id=location_id, # Pass the ID
-            # If new_org_name etc. were provided, you'd populate these instead:
-            # organisation=models.OrganisationCreate(name=new_organisation_name, ...) if new_organisation_name else None,
-            # location=models.LocationCreate(name=new_location_name, ...) if new_location_name else None,
+    new_org_model_db: Optional[models.OrganisationDB] = None
+    if new_organisation_name and not organisation_id:
+        new_org_model_db = models.OrganisationDB(
+            name=new_organisation_name, description=new_organisation_description,
+            url=new_organisation_url or None, contact_phone=new_organisation_contact_phone
         )
 
-        new_offer = data_handler.add_offer(offer_create_data)
-        # Redirect to the detail page of the newly created offer
+    accessibility_list: List[str] = []
+    if new_location_accessibility_json:
+        try:
+            parsed_json = json.loads(new_location_accessibility_json)
+            if isinstance(parsed_json, list):
+                accessibility_list = [str(item) for item in parsed_json if isinstance(item, (str, int, float))]
+        except json.JSONDecodeError:
+            pass # Keep accessibility_list empty
+
+    cost_options_data = []
+    if cost_option_amount is not None and cost_option_option:
+        cost_options_data.append(models.CostOption(amount=cost_option_amount, amount_description=cost_option_amount_description, option=cost_option_option))
+
+    service_areas_data = []
+    if service_area_name:
+        service_areas_data.append(models.ServiceArea(name=service_area_name))
+
+    schedules_data = []
+    parsed_schedule = parse_form_schedule(
+        schedule_description, schedule_opens_at, schedule_closes_at,
+        schedule_valid_from, schedule_valid_to, schedule_weekdays_json
+    )
+    if parsed_schedule: schedules_data.append(parsed_schedule)
+
+    try:
+        # OfferCreateInput now expects individual fields for new_location
+        offer_create_input = models.OfferCreateInput(
+            service_id=service_id, name=name, description=description, url=url or None,
+            status=status, type=type, in_person=in_person, remote=remote,
+            interpretation_services=interpretation_services, phone_support=phone_support,
+            online_support=online_support, eligibility=eligibility,
+            organisation_id=organisation_id, new_organisation=new_org_model_db,
+            location_id=location_id,
+            new_location_name=new_location_name if not location_id else None,
+            new_location_address_1=new_location_address_1 if not location_id else None,
+            new_location_city=new_location_city if not location_id else None,
+            new_location_postal_code=new_location_postal_code if not location_id else None,
+            new_location_latitude=new_location_latitude if not location_id else None,
+            new_location_longitude=new_location_longitude if not location_id else None,
+            new_location_accessibility=accessibility_list if not location_id and new_location_name else [],
+            cost_options=cost_options_data, service_areas=service_areas_data,
+            service_schedules=schedules_data
+        )
+
+        new_offer = data_handler.add_offer(offer_create_input)
         return RedirectResponse(url=app.url_path_for("offer_detail_view", offer_id=new_offer.id), status_code=status.HTTP_303_SEE_OTHER)
 
-    except ValidationError as e:
-        # This is a basic error handling. In a real app, you'd show errors on the form.
-        print(f"Validation Error: {e.errors()}")
-        # For simplicity, redirecting back to form, ideally with error messages.
-        # You would need to pass error messages to the template.
+    except (ValidationError, ValueError) as e:
+        error_detail = e.errors() if isinstance(e, ValidationError) else [{"msg": str(e), "loc": ["form"]}]
+        # ... (error handling remains similar, pass data back to form) ...
         all_organisations = data_handler.get_all_organisations()
         all_locations = data_handler.get_all_locations()
-        # Repopulate form with submitted data + errors (complex for full Pydantic models)
-        # This is a simplified error display:
+        distinct_service_types = data_handler.get_distinct_service_types()
         return templates.TemplateResponse("offer_form.html", {
-            "request": request, "offer": None, "errors": e.errors(),
+            "request": request, "offer": None, "errors": error_detail, # Pass actual submitted values back for repopulation
             "all_organisations": all_organisations, "all_locations": all_locations,
+            "distinct_service_types": distinct_service_types,
             "form_action_url": app.url_path_for("create_offer_action")
         }, status_code=422)
-    except ValueError as e: # From data_handler for missing org/loc
-        all_organisations = data_handler.get_all_organisations()
-        all_locations = data_handler.get_all_locations()
-        return templates.TemplateResponse("offer_form.html", {
-            "request": request, "offer": None, "errors": [{"msg": str(e), "loc": ["form"]}],
-             "all_organisations": all_organisations, "all_locations": all_locations,
-            "form_action_url": app.url_path_for("create_offer_action")
-        }, status_code=400)
 
 
 @app.get("/offers/{offer_id}", response_class=HTMLResponse, name="offer_detail_view")
@@ -197,91 +228,148 @@ async def edit_offer_form(request: Request, offer_id: str):
 
     all_organisations = data_handler.get_all_organisations()
     all_locations = data_handler.get_all_locations()
-    distinct_service_types = data_handler.get_distinct_service_types() # Added for datalist
+    distinct_service_types = data_handler.get_distinct_service_types()
+
+    offer_form_data = offer.model_dump()
+    offer_form_data['organisation_id'] = offer.organisation.id
+    offer_form_data['location_id'] = offer.location.id
+
+    # For new_location_ fields, they are not typically part of an existing offer's data dump for edit
+    # The form should provide fields for lat/lon if user wants to *change* location details,
+    # or select a different existing location.
+    # The current Location model has lat/lon, so these will be in offer_form_data['location']
+    offer_form_data['new_location_latitude'] = offer.location.latitude
+    offer_form_data['new_location_longitude'] = offer.location.longitude
+    offer_form_data['new_location_accessibility_json'] = json.dumps(offer.location.accessibility or [])
+
+
+    if offer.cost_options:
+        co = offer.cost_options[0]
+        offer_form_data.update({
+            'cost_option_amount': co.amount,
+            'cost_option_amount_description': co.amount_description,
+            'cost_option_option': co.option
+        })
+    if offer.service_areas:
+        offer_form_data['service_area_name'] = offer.service_areas[0].name
+    if offer.service_schedules:
+        sched = offer.service_schedules[0]
+        offer_form_data.update({
+            'schedule_description': sched.description,
+            'schedule_opens_at': sched.opens_at.isoformat() if sched.opens_at else None,
+            'schedule_closes_at': sched.closes_at.isoformat() if sched.closes_at else None,
+            'schedule_valid_from': sched.valid_from.isoformat() if sched.valid_from else None,
+            'schedule_valid_to': sched.valid_to.isoformat() if sched.valid_to else None,
+            'schedule_weekdays_json': json.dumps(sched.valid_for_weekdays or [])
+        })
 
     return templates.TemplateResponse(
         "offer_form.html",
         {
-            "request": request,
-            "offer": offer.model_dump(), # Pass existing offer data to the form
-            "all_organisations": all_organisations,
-            "all_locations": all_locations,
-            "distinct_service_types": distinct_service_types, # Pass to template
+            "request": request, "offer": offer_form_data,
+            "all_organisations": all_organisations, "all_locations": all_locations,
+            "distinct_service_types": distinct_service_types,
             "form_action_url": app.url_path_for("edit_offer_action", offer_id=offer_id)
         }
     )
 
 @app.post("/offers/{offer_id}/update", name="edit_offer_action")
 async def edit_offer_action(request: Request, offer_id: str,
-    # Form fields - similar to create, but for update
-    service_id: str = Form(...),
-    name: str = Form(...),
-    description: Optional[str] = Form(None),
-    url: Optional[str] = Form(None),
-    status: str = Form(...),
-    type: str = Form(...),
-    in_person: bool = Form(False),
-    remote: bool = Form(False),
-    interpretation_services: bool = Form(False),
-    phone_support: bool = Form(False),
-    online_support: bool = Form(False),
-    cost_option_amount: float = Form(...),
+    # Similar to create, but new_org/loc fields are for changing to a *newly created* one
+    service_id: str = Form(...), name: str = Form(...), description: Optional[str] = Form(None),
+    url: Optional[str] = Form(None), status: str = Form(...), type: str = Form(...),
+    in_person: bool = Form(False), remote: bool = Form(False),
+    interpretation_services: bool = Form(False), phone_support: bool = Form(False),
+    online_support: bool = Form(False), eligibility: Optional[str] = Form(None),
+    organisation_id: Optional[str] = Form(None), # Can select a different existing org
+    new_organisation_name: Optional[str] = Form(None), # Or create a new one to switch to
+    new_organisation_description: Optional[str] = Form(None),
+    new_organisation_url: Optional[str] = Form(None),
+    new_organisation_contact_phone: Optional[str] = Form(None),
+    location_id: Optional[str] = Form(None), # Can select a different existing loc
+    new_location_name: Optional[str] = Form(None), # Or create a new one
+    new_location_address_1: Optional[str] = Form(None),
+    new_location_city: Optional[str] = Form(None),
+    new_location_postal_code: Optional[str] = Form(None),
+    new_location_latitude: Optional[float] = Form(None),
+    new_location_longitude: Optional[float] = Form(None),
+    new_location_accessibility_json: Optional[str] = Form("[]"),
+    cost_option_amount: Optional[float] = Form(None),
     cost_option_amount_description: Optional[str] = Form(None),
-    cost_option_option: str = Form(...),
-    eligibility: Optional[str] = Form(None),
-    service_area_name: str = Form(...),
+    cost_option_option: Optional[str] = Form(None),
+    service_area_name: Optional[str] = Form(None),
     schedule_description: Optional[str] = Form(None),
-    organisation_id: Optional[str] = Form(None),
-    location_id: Optional[str] = Form(None)
+    schedule_opens_at: Optional[str] = Form(None), schedule_closes_at: Optional[str] = Form(None),
+    schedule_valid_from: Optional[str] = Form(None), schedule_valid_to: Optional[str] = Form(None),
+    schedule_weekdays_json: Optional[str] = Form("[]")
 ):
-    existing_offer = data_handler.get_offer_by_id(offer_id)
-    if not existing_offer:
+    existing_offer_model = data_handler.get_offer_by_id(offer_id)
+    if not existing_offer_model:
         raise HTTPException(status_code=404, detail="Offer not found to update")
 
-    try:
-        cost_options_data = [models.CostOption(amount=cost_option_amount, amount_description=cost_option_amount_description, option=cost_option_option)]
-        service_areas_data = [models.ServiceArea(name=service_area_name)]
-        schedules_data = [models.ServiceSchedule(description=schedule_description)] # Simplified
+    new_org_model_db: Optional[models.OrganisationDB] = None
+    if new_organisation_name and not organisation_id: # If creating a new org to associate
+        new_org_model_db = models.OrganisationDB(name=new_organisation_name, description=new_organisation_description, url=new_organisation_url or None, contact_phone=new_organisation_contact_phone)
 
-        offer_update_data = models.OfferUpdate(
+    accessibility_list: List[str] = []
+    if new_location_accessibility_json:
+        try:
+            parsed_json = json.loads(new_location_accessibility_json)
+            if isinstance(parsed_json, list): accessibility_list = [str(item) for item in parsed_json if isinstance(item, (str, int, float))]
+        except json.JSONDecodeError: pass
+
+    cost_options_data = []
+    if cost_option_amount is not None and cost_option_option:
+        cost_options_data.append(models.CostOption(amount=cost_option_amount, amount_description=cost_option_amount_description, option=cost_option_option))
+
+    service_areas_data = []
+    if service_area_name:
+        service_areas_data.append(models.ServiceArea(name=service_area_name))
+
+    schedules_data = []
+    parsed_schedule = parse_form_schedule(schedule_description, schedule_opens_at, schedule_closes_at, schedule_valid_from, schedule_valid_to, schedule_weekdays_json)
+    if parsed_schedule: schedules_data.append(parsed_schedule)
+
+    try:
+        offer_update_input = models.OfferUpdateInput(
             service_id=service_id, name=name, description=description, url=url or None, status=status, type=type,
             in_person=in_person, remote=remote, interpretation_services=interpretation_services,
-            phone_support=phone_support, online_support=online_support,
-            cost_options=cost_options_data, eligibility=eligibility, service_areas=service_areas_data,
-            service_schedules=schedules_data,
-            organisation_id=organisation_id,
-            location_id=location_id
+            phone_support=phone_support, online_support=online_support, eligibility=eligibility,
+            organisation_id=organisation_id, new_organisation=new_org_model_db,
+            location_id=location_id,
+            new_location_name=new_location_name if not location_id and new_location_name else None, # Only if creating new
+            new_location_address_1=new_location_address_1 if not location_id and new_location_name else None,
+            new_location_city=new_location_city if not location_id and new_location_name else None,
+            new_location_postal_code=new_location_postal_code if not location_id and new_location_name else None,
+            new_location_latitude=new_location_latitude if not location_id and new_location_name else None,
+            new_location_longitude=new_location_longitude if not location_id and new_location_name else None,
+            new_location_accessibility=accessibility_list if not location_id and new_location_name else None,
+            cost_options=cost_options_data if cost_options_data else None,
+            service_areas=service_areas_data if service_areas_data else None,
+            service_schedules=schedules_data if schedules_data else None
         )
 
-        updated_offer = data_handler.update_offer(offer_id, offer_update_data)
+        updated_offer = data_handler.update_offer(offer_id, offer_update_input)
         if not updated_offer:
-             # Should have been caught by get_offer_by_id earlier, but as a safeguard
-            raise HTTPException(status_code=404, detail="Offer not found during update process")
+            raise HTTPException(status_code=404, detail="Offer not found during update or update failed")
 
         return RedirectResponse(url=app.url_path_for("offer_detail_view", offer_id=updated_offer.id), status_code=status.HTTP_303_SEE_OTHER)
 
-    except ValidationError as e:
+    except (ValidationError, ValueError) as e:
+        error_detail = e.errors() if isinstance(e, ValidationError) else [{"msg": str(e), "loc": ["form"]}]
+        # ... (error handling for re-rendering form) ...
         all_organisations = data_handler.get_all_organisations()
         all_locations = data_handler.get_all_locations()
+        distinct_service_types = data_handler.get_distinct_service_types()
+        # Repopulate form with existing_offer_model + errors
+        offer_form_data = existing_offer_model.model_dump()
+        # (Need to re-add simplified fields like in edit_offer_form for consistency if re-rendering)
         return templates.TemplateResponse("offer_form.html", {
-            "request": request,
-            "offer": existing_offer.model_dump(), # Pass original offer data back
-            "errors": e.errors(),
-            "all_organisations": all_organisations,
-            "all_locations": all_locations,
+            "request": request, "offer": offer_form_data, "errors": error_detail,
+            "all_organisations": all_organisations, "all_locations": all_locations,
+            "distinct_service_types": distinct_service_types,
             "form_action_url": app.url_path_for("edit_offer_action", offer_id=offer_id)
         }, status_code=422)
-    except ValueError as e: # From data_handler
-        all_organisations = data_handler.get_all_organisations()
-        all_locations = data_handler.get_all_locations()
-        return templates.TemplateResponse("offer_form.html", {
-            "request": request,
-            "offer": existing_offer.model_dump(),
-            "errors": [{"msg": str(e), "loc": ["form"]}],
-            "all_organisations": all_organisations,
-            "all_locations": all_locations,
-            "form_action_url": app.url_path_for("edit_offer_action", offer_id=offer_id)
-        }, status_code=400)
 
 
 @app.post("/offers/{offer_id}/delete", name="delete_offer_action")
@@ -289,42 +377,17 @@ async def delete_offer_action(offer_id: str):
     deleted = data_handler.delete_offer(offer_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Offer not found for deletion")
-
-    # Redirect to the main list view
-    # Using status.HTTP_303_SEE_OTHER for POST-redirect-GET pattern
     return RedirectResponse(url=app.url_path_for("list_offers_view"), status_code=status.HTTP_303_SEE_OTHER)
 
 
-# --- Optional: API endpoints if you want to expose JSON data directly ---
-# @app.get("/api/offers", response_model=List[models.Offer])
-# async def api_get_offers(
-#     service_type: Optional[str] = None,
-#     city: Optional[str] = None,
-#     in_person: Optional[bool] = None,
-#     remote: Optional[bool] = None,
-#     organisation_name: Optional[str] = None
-# ):
-#     return data_handler.load_offers(
-#         service_type=service_type, city=city, in_person=in_person, remote=remote, organisation_name=organisation_name
-#     )
-
-# @app.get("/api/offers/{offer_id}", response_model=models.Offer)
-# async def api_get_offer(offer_id: str):
-#     offer = data_handler.get_offer_by_id(offer_id)
-#     if not offer:
-#         raise HTTPException(status_code=404, detail="Offer not found")
-#     return offer
-
-# To run the app (from the terminal, in the project directory):
-# uvicorn main:app --reload
-# (Ensure main.py contains your FastAPI app instance named 'app')
-# (And that offers.json exists or is created, e.g., by running generate_data.py once)
-
 if __name__ == "__main__":
-    # This block is for development convenience, not for production deployment.
-    # Production servers like Gunicorn or Uvicorn directly target the `app` object.
-    # Example: uvicorn main:app --host 0.0.0.0 --port 8000
     import uvicorn
-    print("Starting Uvicorn server. Make sure 'offers.json' exists.")
-    print("If 'offers.json' does not exist, run 'python generate_data.py > offers.json' first.")
+    print("Starting Uvicorn server for PostGIS setup.")
+    print("Ensure PostgreSQL is running and 'offers_db' is created with PostGIS extension.")
+    print("Run 'initialize_database.py' if tables are not set up.")
+    print("Run 'migrate_json_to_postgres.py' if data needs to be migrated.")
+    # Set ENV VARS for DB connection if not already set in environment:
+    # os.environ['PGDATABASE'] = 'offers_db'
+    # os.environ['PGUSER'] = 'offer_user'
+    # os.environ['PGPASSWORD'] = 'offer_password'
     uvicorn.run(app, host="0.0.0.0", port=8000)
