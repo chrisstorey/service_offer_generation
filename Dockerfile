@@ -18,11 +18,11 @@ RUN groupadd -r appgroup && useradd --no-log-init -r -g appgroup appuser
 WORKDIR /app
 
 # Copy the requirements file into the container at /app
-COPY requirements.txt .
-
+COPY pyproject.toml .
 # Install any needed packages specified in requirements.txt
 # Using --no-cache-dir to reduce image size
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir uv
+RUN uv sync
 
 # Bundle app source
 COPY . .
@@ -30,8 +30,6 @@ COPY . .
 # Change ownership of the app directory
 RUN chown -R appuser:appgroup /app
 
-# Switch to the non-root user
-USER appuser
 
 # Make port 8000 available to the world outside this container
 EXPOSE 8000
@@ -45,7 +43,8 @@ ENV APP_PORT="8000"
 # Copy the entrypoint script
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
-
+# Switch to the non-root user
+USER appuser
 # Run app.py when the container launches
 ENTRYPOINT ["/entrypoint.sh"]
 # The CMD from before will now be passed as arguments to entrypoint.sh
