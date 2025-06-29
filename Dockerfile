@@ -1,5 +1,5 @@
 # Use an official Python runtime as a parent image
-FROM python:3.11-slim
+FROM python:3.13-bookworm
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE 1
@@ -19,10 +19,12 @@ WORKDIR /app
 
 # Copy the requirements file into the container at /app
 COPY pyproject.toml .
+COPY requirements.txt .
 # Install any needed packages specified in requirements.txt
 # Using --no-cache-dir to reduce image size
+RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir uv
-RUN uv sync
+#RUN uv sync
 
 # Bundle app source
 COPY . .

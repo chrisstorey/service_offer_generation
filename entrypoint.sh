@@ -11,7 +11,7 @@ echo "Waiting for PostgreSQL to be available at $PGHOST:$PGPORT..."
 # Timeout after a certain number of attempts to avoid infinite loop
 attempts=0
 max_attempts=30 # Approx 30 seconds if interval is 1s
-until pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -q; do
+until /usr/bin/pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -q; do
   attempts=$((attempts+1))
   if [ "$attempts" -ge "$max_attempts" ]; then
     echo "PostgreSQL did not become available after $max_attempts attempts. Exiting."
