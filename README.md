@@ -34,9 +34,73 @@ This project is a simple CRUD (Create, Read, Update, Delete) service for managin
 
 ## Setup and Installation
 
-Follow these steps to set up and run the project locally:
+There are two primary ways to set up and run this project:
 
-**1. Clone the Repository (if applicable)**
+1.  **Using Docker Compose (Recommended for ease of use and consistent environment)**
+2.  **Manual Local Setup (If you prefer to manage services directly)**
+
+---
+
+### 1. Using Docker Compose
+
+This is the recommended method as it handles the setup of the PostGIS database and the application environment.
+
+**Prerequisites:**
+*   Docker: [Install Docker](https://docs.docker.com/get-docker/)
+*   Docker Compose: Usually included with Docker Desktop. If not, [install Docker Compose](https://docs.docker.com/compose/install/).
+
+**Steps:**
+
+**a. Clone the Repository (if not already done)**
+```bash
+git clone <repository-url>
+cd <repository-directory>
+```
+
+**b. Environment Variables for Docker Compose (Optional - uses defaults)**
+The `docker-compose.yml` file is pre-configured with default database credentials:
+*   `POSTGRES_USER=offer_user`
+*   `POSTGRES_PASSWORD=offer_password`
+*   `POSTGRES_DB=offers_db`
+The application service (`app`) will automatically use these to connect to the `db` service.
+If you need to change these, you can modify them directly in `docker-compose.yml` or set up a `.env` file (see Docker Compose documentation for using `.env` files).
+
+**c. Build and Run the Services**
+From the project root directory (where `docker-compose.yml` is located):
+```bash
+docker-compose up --build
+```
+*   `--build`: Forces Docker Compose to build the application image from the `Dockerfile` if it's the first time or if changes have been made.
+*   This command will start the PostGIS database service and the FastAPI application service.
+*   The `entrypoint.sh` script in the `app` service will automatically:
+    1.  Wait for the PostgreSQL database to be ready.
+    2.  Run `python initialize_database.py` to create the schema and tables (including enabling PostGIS).
+    3.  Run `python migrate_json_to_postgres.py` to import data from `offers.json`.
+    4.  Start the Uvicorn server for the FastAPI application.
+
+The application will be available at `http://localhost:8000`.
+
+**d. Accessing Services**
+*   **Application**: `http://localhost:8000`
+*   **PostgreSQL Database**: Can be accessed on `localhost:5432` using the credentials `offer_user`/`offer_password` and database `offers_db` if you need to inspect it directly (e.g., with `psql` or a GUI tool).
+
+**e. Stopping the Services**
+Press `Ctrl+C` in the terminal where `docker-compose up` is running. To remove the containers (and the network, but not the named volume `postgres_data`):
+```bash
+docker-compose down
+```
+To remove containers AND the named volume (deleting all database data):
+```bash
+docker-compose down -v
+```
+
+---
+
+### 2. Manual Local Setup
+
+Follow these steps if you prefer to manage PostgreSQL and the Python environment manually.
+
+**a. Clone the Repository (if applicable)**
 
 ```bash
 git clone <repository-url>
@@ -97,24 +161,23 @@ pip install -r requirements.txt  # Assuming you create a requirements.txt
 # For now, direct install:
 pip install fastapi uvicorn "pydantic>=2.0" psycopg2-binary jinja2 markupsafe python-multipart
 ```
-*(Note: A `requirements.txt` or fully configured `pyproject.toml` is recommended for production).*
+*(A `requirements.txt` file is provided, so you can also use `pip install -r requirements.txt` after activating the virtual environment).*
 
-**7. Initialize Database Tables**
+**f. Initialize Database Tables**
 
 Run the script to create the necessary tables in your PostgreSQL database:
 ```bash
 python initialize_database.py
 ```
 
-**8. Migrate Data (Optional)**
+**g. Migrate Data (Optional)**
 
-If you have an existing `offers.json` file and want to import its data into the PostgreSQL database, run:
+If you have an existing `offers.json` file (you can create one using `python generate_data.py > offers.json` if needed) and want to import its data into the PostgreSQL database, run:
 ```bash
 python migrate_json_to_postgres.py
 ```
-*(Note: The `generate_data.py` script can still be used to create a sample `offers.json` if you need one for migration).*
 
-**9. Run the Application**
+**h. Run the Application**
 
 Use Uvicorn to run the FastAPI application:
 ```bash
@@ -136,8 +199,9 @@ The application will typically be available at `http://127.0.0.1:8000`.
 *   **Uvicorn**: ASGI server.
 *   **Pydantic**: Data validation and settings management.
 *   **PostgreSQL**: Robust open-source relational database.
-*   **PostGIS**: Spatial database extender for PostgreSQL. Adds support for geographic objects.
+*   **PostGIS**: Spatial database extender for PostgreSQL.
 *   **psycopg2-binary**: Python adapter for PostgreSQL.
+*   **Docker & Docker Compose**: For containerization and service orchestration.
 *   **Jinja2**: Templating engine for HTML.
 *   **Bootstrap**: Front-end toolkit (if static files and templates use it).
 *   **Leaflet.js**: JavaScript library for interactive maps.
