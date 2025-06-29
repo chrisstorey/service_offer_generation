@@ -1,313 +1,416 @@
+import psycopg2
+import psycopg2.extras # For DictCursor
+import uuid
 import json
 import os
-import uuid
-from typing import List, Optional, Dict, Any
-from pydantic import ValidationError
+from typing import List, Optional, Dict, Any, Tuple
+from datetime import time, date
 
-from models import Offer, OfferCreate, OfferUpdate, Location, Organisation, LocationCreate, OrganisationCreate
+from models import (
+    Offer, Organisation, Location,
+    OfferCreateInput, OfferUpdateInput,
+    OfferDB, OrganisationDB, LocationDB, # LocationDB now has lat/lon for input to this handler
+    CostOptionDB, ServiceScheduleDB, ServiceAreaDB,
+    CostOption, ServiceSchedule, ServiceArea
+)
 
-OFFERS_FILE = "offers.json"
-# For simplicity in this example, we'll assume organisations and locations data
-# are primarily managed within the offers.json structure.
-# A more robust system would have separate storage for them.
+DB_NAME = os.getenv("PGDATABASE", "offers_db")
+DB_USER = os.getenv("PGUSER", "offer_user")
+DB_PASSWORD = os.getenv("PGPASSWORD", "offer_password")
+DB_HOST = os.getenv("PGHOST", "localhost")
+DB_PORT = os.getenv("PGPORT", "5432")
 
-_offers_cache: List[Offer] = []
-_organisations_cache: Dict[str, Organisation] = {}
-_locations_cache: Dict[str, Location] = {}
+def get_db_connection() -> psycopg2.extensions.connection:
+    """Establishes and returns a new PostgreSQL database connection."""
+    conn_string = f"dbname='{DB_NAME}' user='{DB_USER}' password='{DB_PASSWORD}' host='{DB_HOST}' port='{DB_PORT}'"
+    conn = psycopg2.connect(conn_string)
+    return conn
+
+def _dict_row(cursor: psycopg2.extensions.cursor) -> Optional[Dict[str, Any]]:
+    """Converts a fetched row to a dict if a row exists."""
+    row = cursor.fetchone()
+    if row:
+        return {desc[0]: value for desc, value in zip(cursor.description, row)}
+    return None
+
+def _dict_rows(cursor: psycopg2.extensions.cursor) -> List[Dict[str, Any]]:
+    """Converts all fetched rows to a list of dicts."""
+    return [{desc[0]: value for desc, value in zip(cursor.description, row)} for row in cursor.fetchall()]
 
 
-def _load_data_from_json():
-    """Loads offers, organisations, and locations from the JSON file into memory."""
-    global _offers_cache, _organisations_cache, _locations_cache
-    if not os.path.exists(OFFERS_FILE):
-        _offers_cache = []
-        _organisations_cache = {}
-        _locations_cache = {}
-        return
+def _fetch_organisation(org_id: str, cursor: psycopg2.extensions.cursor) -> Optional[Organisation]:
+    cursor.execute("SELECT * FROM organisations WHERE id = %s", (org_id,))
+    row_dict = _dict_row(cursor)
+    return Organisation(**row_dict) if row_dict else None
 
-    try:
-        with open(OFFERS_FILE, "r") as f:
-            raw_data = json.load(f)
-    except (json.JSONDecodeError, FileNotFoundError):
-        _offers_cache = []
-        _organisations_cache = {}
-        _locations_cache = {}
-        return
+def _fetch_location(loc_id: str, cursor: psycopg2.extensions.cursor) -> Optional[Location]:
+    # Retrieve ST_X(geom) as longitude, ST_Y(geom) as latitude
+    cursor.execute(
+        "SELECT id, name, address_1, city, postal_code, "
+        "ST_X(geom) AS longitude, ST_Y(geom) AS latitude, accessibility "
+        "FROM locations WHERE id = %s", (loc_id,)
+    )
+    row_dict = _dict_row(cursor)
+    if not row_dict:
+        return None
 
-    temp_offers = []
-    temp_orgs = {}
-    temp_locs = {}
-
-    for item_data in raw_data:
+    # accessibility is JSONB, psycopg2 should convert it to a Python list automatically.
+    # If it's a string, it means it wasn't properly inserted as JSONB or auto-conversion isn't happening.
+    # Models.py Location expects accessibility to be List[str].
+    if isinstance(row_dict.get('accessibility'), str): # Should ideally be list from JSONB
         try:
-            # Extract and cache organisation
-            org_data = item_data.get("organisation")
-            if org_data and org_data.get("id"):
-                if org_data["id"] not in temp_orgs:
-                    org = Organisation(**org_data)
-                    temp_orgs[org.id] = org
+            row_dict['accessibility'] = json.loads(row_dict['accessibility'])
+        except json.JSONDecodeError:
+            row_dict['accessibility'] = []
 
-            # Extract and cache location
-            loc_data = item_data.get("location")
-            if loc_data and loc_data.get("id"):
-                if loc_data["id"] not in temp_locs:
-                    loc = Location(**loc_data)
-                    temp_locs[loc.id] = loc
-
-            # Create offer model instance
-            # Ensure organisation and location are fully populated for the Offer model
-            if org_data and loc_data:
-                 # Create a copy to avoid modifying the original dict during iteration if necessary
-                offer_model_data = item_data.copy()
-                offer_model_data["organisation"] = temp_orgs.get(org_data["id"])
-                offer_model_data["location"] = temp_locs.get(loc_data["id"])
-
-                # Filter out None values for organisation and location if they weren't found
-                # This should ideally not happen if data is consistent
-                if offer_model_data["organisation"] and offer_model_data["location"]:
-                    offer = Offer(**offer_model_data)
-                    temp_offers.append(offer)
-                else:
-                    print(f"Warning: Skipping offer due to missing organisation/location data: {item_data.get('id')}")
-
-        except ValidationError as e:
-            print(f"Validation error loading item: {item_data.get('id', 'Unknown ID')}: {e}")
-        except Exception as e:
-            print(f"Generic error loading item: {item_data.get('id', 'Unknown ID')}: {e}")
-
-    _offers_cache = temp_offers
-    _organisations_cache = temp_orgs
-    _locations_cache = temp_locs
+    return Location(**row_dict)
 
 
-def _save_data_to_json():
-    """Saves the current state of offers (including their embedded orgs/locs) to the JSON file."""
-    # We need to serialize the Offer models, which include nested Organisation and Location models.
-    # Pydantic's model_dump(mode='json') or jsonable_encoder can be used.
+def _fetch_cost_options(offer_id: str, cursor: psycopg2.extensions.cursor) -> List[CostOption]:
+    cursor.execute("SELECT amount, amount_description, option FROM cost_options WHERE offer_id = %s", (offer_id,))
+    return [CostOption(**row_dict) for row_dict in _dict_rows(cursor)]
 
-    # FastAPI's jsonable_encoder is handy here if we were in a FastAPI context,
-    # but Pydantic's model_dump works directly.
+def _fetch_service_schedules(offer_id: str, cursor: psycopg2.extensions.cursor) -> List[ServiceSchedule]:
+    cursor.execute("SELECT opens_at, closes_at, valid_from, valid_to, valid_for_weekdays, description FROM service_schedules WHERE offer_id = %s", (offer_id,))
+    schedules_data = _dict_rows(cursor)
+    # valid_for_weekdays is JSONB, psycopg2 should convert to list.
+    # opens_at, closes_at are TIME, psycopg2 converts to datetime.time.
+    # valid_from, valid_to are DATE, psycopg2 converts to datetime.date.
+    return [ServiceSchedule(**s) for s in schedules_data]
 
-    serializable_offers = [offer.model_dump(mode="python") for offer in _offers_cache]
 
-    with open(OFFERS_FILE, "w") as f:
-        json.dump(serializable_offers, f, indent=2, default=str) # default=str for date/time
+def _fetch_service_areas(offer_id: str, cursor: psycopg2.extensions.cursor) -> List[ServiceArea]:
+    cursor.execute("SELECT name FROM service_areas WHERE offer_id = %s", (offer_id,))
+    return [ServiceArea(**row_dict) for row_dict in _dict_rows(cursor)]
 
+def _construct_offer_from_db_data(offer_db_data: Dict[str, Any], cursor: psycopg2.extensions.cursor) -> Offer:
+    offer_id = offer_db_data["id"]
 
-# Initial load of data when module is imported
-_load_data_from_json()
+    org = _fetch_organisation(offer_db_data["organisation_id"], cursor)
+    loc = _fetch_location(offer_db_data["location_id"], cursor)
 
+    if not org or not loc:
+        raise ValueError(f"Organisation or Location not found for offer {offer_id}")
+
+    # Boolean fields are directly handled by psycopg2
+    return Offer(
+        **offer_db_data, # Pass the dict directly
+        organisation=org,
+        location=loc,
+        cost_options=_fetch_cost_options(offer_id, cursor),
+        service_schedules=_fetch_service_schedules(offer_id, cursor),
+        service_areas=_fetch_service_areas(offer_id, cursor)
+    )
 
 def load_offers(
     service_type: Optional[str] = None,
     city: Optional[str] = None,
     in_person: Optional[bool] = None,
     remote: Optional[bool] = None,
-    organisation_name: Optional[str] = None
+    organisation_name: Optional[str] = None,
+    # PostGIS specific filters (example)
+    current_lat: Optional[float] = None,
+    current_lon: Optional[float] = None,
+    radius_km: Optional[float] = None
 ) -> List[Offer]:
-    """Loads all offers from the JSON file, with optional filtering."""
-    if not _offers_cache: # Ensure data is loaded if cache is empty
-        _load_data_from_json()
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-    filtered_offers = _offers_cache
+    query_parts = ["SELECT o.* FROM offers o"]
+    joins = [
+        "LEFT JOIN locations l ON o.location_id = l.id",
+        "LEFT JOIN organisations org ON o.organisation_id = org.id"
+    ]
+    conditions = ["1=1"]
+    params: List[Any] = []
 
     if service_type:
-        filtered_offers = [o for o in filtered_offers if o.type and service_type.lower() in o.type.lower()]
+        conditions.append("o.type ILIKE %s") # ILIKE for case-insensitive
+        params.append(f"%{service_type}%")
     if city:
-        filtered_offers = [o for o in filtered_offers if o.location and o.location.city and city.lower() in o.location.city.lower()]
+        conditions.append("l.city ILIKE %s")
+        params.append(f"%{city}%")
     if in_person is not None:
-        filtered_offers = [o for o in filtered_offers if o.in_person == in_person]
+        conditions.append("o.in_person = %s")
+        params.append(in_person)
     if remote is not None:
-        filtered_offers = [o for o in filtered_offers if o.remote == remote]
+        conditions.append("o.remote = %s")
+        params.append(remote)
     if organisation_name:
-        filtered_offers = [o for o in filtered_offers if o.organisation and o.organisation.name and organisation_name.lower() in o.organisation.name.lower()]
+        conditions.append("org.name ILIKE %s")
+        params.append(f"%{organisation_name}%")
 
-    return filtered_offers
+    if current_lat is not None and current_lon is not None and radius_km is not None:
+        # Ensure PostGIS is enabled and l.geom exists for this to work
+        # ST_DWithin uses meters for geometry, or degrees for geography.
+        # Assuming geom is GEOMETRY(Point, 4326) (degrees), radius needs conversion or use geography.
+        # For simplicity, let's assume we might use ST_DistanceSphere for direct degree comparison if geom is Point.
+        # Or, more robustly, cast to geography for ST_DWithin in meters.
+        # ST_DWithin(geography(l.geom), ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)
+        # This example uses a simpler form, assuming l.geom is geography or a cast will work.
+        # Note: Proper spatial queries can be complex and depend on exact column types and indexing.
+        conditions.append("ST_DWithin(l.geom::geography, ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography, %s)")
+        params.extend([current_lon, current_lat, radius_km * 1000]) # radius in meters
+
+
+    final_query = " ".join(query_parts + joins) + " WHERE " + " AND ".join(conditions) + " ORDER BY o.name;"
+
+    cursor.execute(final_query, tuple(params))
+    offer_rows_dicts = _dict_rows(cursor)
+
+    offers = [_construct_offer_from_db_data(row_dict, cursor) for row_dict in offer_rows_dicts]
+
+    conn.close()
+    return offers
 
 def get_offer_by_id(offer_id: str) -> Optional[Offer]:
-    """Retrieves a single offer by its ID."""
-    if not _offers_cache:
-        _load_data_from_json()
-    for offer in _offers_cache:
-        if offer.id == offer_id:
-            return offer
-    return None
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM offers WHERE id = %s", (offer_id,))
+    row_dict = _dict_row(cursor)
 
-def add_offer(offer_data: OfferCreate) -> Offer:
-    """Adds a new offer to the list and saves to JSON."""
-    global _offers_cache, _organisations_cache, _locations_cache
+    offer = None
+    if row_dict:
+        offer = _construct_offer_from_db_data(row_dict, cursor)
 
-    # Handle Organisation
-    org: Optional[Organisation] = None
-    if offer_data.organisation_id and offer_data.organisation_id in _organisations_cache:
-        org = _organisations_cache[offer_data.organisation_id]
-    elif offer_data.organisation:
-        # Create new organisation if full object is provided
-        new_org_id = str(uuid.uuid4())
-        org_create_data = offer_data.organisation.model_dump()
-        org = Organisation(id=new_org_id, **org_create_data)
-        _organisations_cache[new_org_id] = org
-    if not org:
-        raise ValueError("Organisation data is missing or invalid.")
+    conn.close()
+    return offer
 
-    # Handle Location
-    loc: Optional[Location] = None
-    if offer_data.location_id and offer_data.location_id in _locations_cache:
-        loc = _locations_cache[offer_data.location_id]
-    elif offer_data.location:
-        # Create new location if full object is provided
-        new_loc_id = str(uuid.uuid4())
-        loc_create_data = offer_data.location.model_dump()
-        loc = Location(id=new_loc_id, **loc_create_data)
-        _locations_cache[new_loc_id] = loc
-    if not loc:
-        raise ValueError("Location data is missing or invalid.")
+def add_offer(offer_data: OfferCreateInput) -> Offer:
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-    new_offer_id = str(uuid.uuid4())
-
-    # Construct the full Offer model
-    # Exclude 'organisation' and 'location' from OfferCreate as they are handled above
-    offer_base_data = offer_data.model_dump(exclude={"organisation", "location", "organisation_id", "location_id"})
-
-    new_offer = Offer(
-        id=new_offer_id,
-        **offer_base_data,
-        organisation=org,
-        location=loc
-    )
-
-    _offers_cache.append(new_offer)
-    _save_data_to_json()
-    return new_offer
-
-def update_offer(offer_id: str, offer_data: OfferUpdate) -> Optional[Offer]:
-    """Updates an existing offer by ID and saves to JSON."""
-    global _offers_cache, _organisations_cache, _locations_cache
-    offer_to_update = get_offer_by_id(offer_id)
-    if not offer_to_update:
-        return None
-
-    update_data = offer_data.model_dump(exclude_unset=True)
-
-    # Handle nested Organisation update/creation
-    if "organisation" in update_data and isinstance(update_data["organisation"], dict):
-        org_create_data = OrganisationCreate(**update_data.pop("organisation"))
-        if offer_to_update.organisation: # Update existing
-            updated_org_data = org_create_data.model_dump(exclude_unset=True)
-            for key, value in updated_org_data.items():
-                setattr(offer_to_update.organisation, key, value)
-            _organisations_cache[offer_to_update.organisation.id] = offer_to_update.organisation
-        else: # This case should ideally not happen if data is consistent
-             raise ValueError("Cannot update non-existent organisation on offer.")
-    elif "organisation_id" in update_data:
-        org_id = update_data["organisation_id"]
-        if org_id in _organisations_cache:
-            offer_to_update.organisation = _organisations_cache[org_id]
-        else:
-            raise ValueError(f"Organisation with ID {org_id} not found.")
-
-
-    # Handle nested Location update/creation
-    if "location" in update_data and isinstance(update_data["location"], dict):
-        loc_create_data = LocationCreate(**update_data.pop("location"))
-        if offer_to_update.location: # Update existing
-            updated_loc_data = loc_create_data.model_dump(exclude_unset=True)
-            for key, value in updated_loc_data.items():
-                setattr(offer_to_update.location, key, value)
-            _locations_cache[offer_to_update.location.id] = offer_to_update.location
-        else:
-            raise ValueError("Cannot update non-existent location on offer.")
-    elif "location_id" in update_data:
-        loc_id = update_data["location_id"]
-        if loc_id in _locations_cache:
-            offer_to_update.location = _locations_cache[loc_id]
-        else:
-            raise ValueError(f"Location with ID {loc_id} not found.")
-
-
-    # Update top-level fields
-    for key, value in update_data.items():
-        if hasattr(offer_to_update, key):
-            # Handle complex types like lists of Pydantic models (e.g. cost_options)
-            if isinstance(value, list) and value and isinstance(value[0], dict):
-                field_type = offer_to_update.__annotations__.get(key)
-                # This is a simplification; proper list updates are more complex
-                # For now, we replace the list.
-                # E.g., if field_type is List[CostOption]
-                # model_list = [CostOption(**item) for item in value]
-                # setattr(offer_to_update, key, model_list)
-                # For now, direct assignment if the structure matches:
-                try:
-                    if key == "cost_options":
-                        offer_to_update.cost_options = [CostOption(**co) for co in value]
-                    elif key == "service_areas":
-                        offer_to_update.service_areas = [ServiceArea(**sa) for sa in value]
-                    elif key == "service_schedules":
-                         offer_to_update.service_schedules = [ServiceSchedule(**ss) for ss in value]
-                    else:
-                         setattr(offer_to_update, key, value)
-                except ValidationError as e:
-                    print(f"Validation error updating field {key}: {e}")
-                    # Potentially skip this field or raise error
-            else:
-                setattr(offer_to_update, key, value)
-
-    # Re-validate the whole model (optional, but good for consistency)
     try:
-        Offer(**offer_to_update.model_dump())
-    except ValidationError as e:
-        print(f"Post-update validation failed for offer {offer_id}: {e}")
-        # Potentially revert changes or handle error
-        return None # Or raise error
+        db_org_id: Optional[str] = offer_data.organisation_id
+        if not db_org_id and offer_data.new_organisation:
+            org_db = offer_data.new_organisation # This is OrganisationDB
+            if not org_db.id: org_db.id = str(uuid.uuid4())
+            cursor.execute(
+                "INSERT INTO organisations (id, name, description, url, contact_phone) VALUES (%s, %s, %s, %s, %s) RETURNING id;",
+                (org_db.id, org_db.name, org_db.description, str(org_db.url) if org_db.url else None, org_db.contact_phone)
+            )
+            db_org_id = cursor.fetchone()[0]
+        elif not db_org_id:
+             raise ValueError("Organisation ID or new Organisation data must be provided.")
 
-    _save_data_to_json()
-    return offer_to_update
+        db_loc_id: Optional[str] = offer_data.location_id
+        if not db_loc_id:
+            if offer_data.new_location_name and offer_data.new_location_latitude is not None and offer_data.new_location_longitude is not None:
+                loc_id_to_insert = str(uuid.uuid4())
+                # psycopg2 can handle list for JSONB if new_location_accessibility is List[str]
+                # The model OfferCreateInput defines new_location_accessibility as List[str]
+                accessibility_jsonb = json.dumps(offer_data.new_location_accessibility)
 
+                cursor.execute(
+                    "INSERT INTO locations (id, name, address_1, city, postal_code, geom, accessibility) "
+                    "VALUES (%s, %s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326), %s) RETURNING id;",
+                    (loc_id_to_insert, offer_data.new_location_name, offer_data.new_location_address_1,
+                     offer_data.new_location_city, offer_data.new_location_postal_code,
+                     offer_data.new_location_longitude, offer_data.new_location_latitude, # lon, lat for ST_MakePoint
+                     accessibility_jsonb)
+                )
+                db_loc_id = cursor.fetchone()[0]
+            else:
+                raise ValueError("Location ID or new Location data (name, lat, lon) must be provided.")
+
+        new_offer_db_id = str(uuid.uuid4())
+        offer_db_vals = (
+            new_offer_db_id, offer_data.service_id, db_loc_id, db_org_id, offer_data.name,
+            offer_data.description, str(offer_data.url) if offer_data.url else None,
+            offer_data.status, offer_data.type, offer_data.in_person, offer_data.remote,
+            offer_data.interpretation_services, offer_data.phone_support, offer_data.online_support,
+            offer_data.eligibility
+        )
+        cursor.execute(
+            "INSERT INTO offers (id, service_id, location_id, organisation_id, name, description, url, "
+            "status, type, in_person, remote, interpretation_services, phone_support, online_support, eligibility) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);",
+            offer_db_vals
+        )
+
+        for co in offer_data.cost_options:
+            co_db = CostOptionDB(offer_id=new_offer_db_id, **co.model_dump())
+            cursor.execute("INSERT INTO cost_options (id, offer_id, amount, amount_description, option) VALUES (%s,%s,%s,%s,%s);",
+                           (co_db.id, co_db.offer_id, co_db.amount, co_db.amount_description, co_db.option))
+
+        for sched in offer_data.service_schedules:
+            sched_db = ServiceScheduleDB(offer_id=new_offer_db_id, **sched.model_dump())
+            cursor.execute(
+                "INSERT INTO service_schedules (id, offer_id, opens_at, closes_at, valid_from, valid_to, valid_for_weekdays, description) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s);",
+                (sched_db.id, sched_db.offer_id, sched_db.opens_at, sched_db.closes_at, sched_db.valid_from,
+                 sched_db.valid_to, json.dumps(sched_db.valid_for_weekdays), sched_db.description) # weekdays as JSONB
+            )
+
+        for area in offer_data.service_areas:
+            area_db = ServiceAreaDB(offer_id=new_offer_db_id, **area.model_dump())
+            cursor.execute("INSERT INTO service_areas (id, offer_id, name) VALUES (%s,%s,%s);",
+                           (area_db.id, area_db.offer_id, area_db.name))
+        conn.commit()
+
+        cursor.execute("SELECT * FROM offers WHERE id = %s", (new_offer_db_id,))
+        new_offer_row_dict = _dict_row(cursor)
+        if not new_offer_row_dict: raise Exception("Failed to retrieve newly added offer.")
+
+        return _construct_offer_from_db_data(new_offer_row_dict, cursor)
+
+    except (psycopg2.Error, ValueError, Exception) as e:
+        if conn: conn.rollback()
+        raise ValueError(f"Database error adding offer: {e}") from e
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
+
+
+def update_offer(offer_id: str, offer_data: OfferUpdateInput) -> Optional[Offer]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT organisation_id, location_id FROM offers WHERE id = %s", (offer_id,))
+        existing_refs = _dict_row(cursor)
+        if not existing_refs: return None
+
+        current_org_id = offer_data.organisation_id if offer_data.organisation_id else existing_refs['organisation_id']
+        current_loc_id = offer_data.location_id if offer_data.location_id else existing_refs['location_id']
+
+        if offer_data.new_organisation and not offer_data.organisation_id : # Create new org if full data given AND no ID
+            org_db = offer_data.new_organisation
+            if not org_db.id: org_db.id = str(uuid.uuid4())
+            cursor.execute(
+                "INSERT INTO organisations (id, name, description, url, contact_phone) VALUES (%s,%s,%s,%s,%s) "
+                "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, description=EXCLUDED.description, url=EXCLUDED.url, contact_phone=EXCLUDED.contact_phone RETURNING id;",
+                (org_db.id, org_db.name, org_db.description, str(org_db.url) if org_db.url else None, org_db.contact_phone)
+            )
+            current_org_id = cursor.fetchone()[0]
+
+        if offer_data.new_location_name and offer_data.new_location_latitude is not None and \
+           offer_data.new_location_longitude is not None and not offer_data.location_id:
+            loc_id_to_use = str(uuid.uuid4())
+            accessibility_jsonb = json.dumps(offer_data.new_location_accessibility or [])
+            cursor.execute(
+                "INSERT INTO locations (id, name, address_1, city, postal_code, geom, accessibility) "
+                "VALUES (%s,%s,%s,%s,%s, ST_SetSRID(ST_MakePoint(%s,%s),4326), %s) "
+                "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, address_1=EXCLUDED.address_1, city=EXCLUDED.city, postal_code=EXCLUDED.postal_code, geom=EXCLUDED.geom, accessibility=EXCLUDED.accessibility RETURNING id;",
+                (loc_id_to_use, offer_data.new_location_name, offer_data.new_location_address_1, offer_data.new_location_city,
+                 offer_data.new_location_postal_code, offer_data.new_location_longitude, offer_data.new_location_latitude,
+                 accessibility_jsonb)
+            )
+            current_loc_id = cursor.fetchone()[0]
+
+        # Build SET clause for offers table
+        update_dict = offer_data.model_dump(exclude_unset=True, exclude={'organisation_id', 'new_organisation', 'location_id',
+                                                                      'new_location_name', 'new_location_address_1',
+                                                                      'new_location_city', 'new_location_postal_code',
+                                                                      'new_location_latitude', 'new_location_longitude',
+                                                                      'new_location_accessibility',
+                                                                      'cost_options', 'service_schedules', 'service_areas'})
+        update_dict['organisation_id'] = current_org_id
+        update_dict['location_id'] = current_loc_id
+
+        if update_dict: # Only update if there are fields to update
+            set_clauses = [f"{key} = %s" for key in update_dict.keys()]
+            params = list(update_dict.values()) + [offer_id]
+            cursor.execute(f"UPDATE offers SET {', '.join(set_clauses)} WHERE id = %s", tuple(params))
+
+        # Update related list-like items (delete all then re-insert)
+        if offer_data.cost_options is not None:
+            cursor.execute("DELETE FROM cost_options WHERE offer_id = %s", (offer_id,))
+            for co in offer_data.cost_options:
+                co_db = CostOptionDB(offer_id=offer_id, **co.model_dump())
+                cursor.execute("INSERT INTO cost_options (id,offer_id,amount,amount_description,option) VALUES (%s,%s,%s,%s,%s);", tuple(co_db.model_dump().values()))
+
+        if offer_data.service_schedules is not None:
+            cursor.execute("DELETE FROM service_schedules WHERE offer_id = %s", (offer_id,))
+            for sched in offer_data.service_schedules:
+                sched_db = ServiceScheduleDB(offer_id=offer_id, **sched.model_dump())
+                cursor.execute("INSERT INTO service_schedules (id,offer_id,opens_at,closes_at,valid_from,valid_to,valid_for_weekdays,description) VALUES (%s,%s,%s,%s,%s,%s,%s,%s);",
+                               (sched_db.id, sched_db.offer_id, sched_db.opens_at, sched_db.closes_at, sched_db.valid_from, sched_db.valid_to, json.dumps(sched_db.valid_for_weekdays), sched_db.description))
+
+        if offer_data.service_areas is not None:
+            cursor.execute("DELETE FROM service_areas WHERE offer_id = %s", (offer_id,))
+            for area in offer_data.service_areas:
+                area_db = ServiceAreaDB(offer_id=offer_id, **area.model_dump())
+                cursor.execute("INSERT INTO service_areas (id,offer_id,name) VALUES (%s,%s,%s);", tuple(area_db.model_dump().values()))
+
+        conn.commit()
+
+        cursor.execute("SELECT * FROM offers WHERE id = %s", (offer_id,))
+        updated_offer_row_dict = _dict_row(cursor)
+        if not updated_offer_row_dict: return None
+        return _construct_offer_from_db_data(updated_offer_row_dict, cursor)
+
+    except (psycopg2.Error, ValueError, Exception) as e:
+        if conn: conn.rollback()
+        raise ValueError(f"Database error updating offer {offer_id}: {e}") from e
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def delete_offer(offer_id: str) -> bool:
-    """Deletes an offer by its ID and saves to JSON."""
-    global _offers_cache
-    initial_len = len(_offers_cache)
-    _offers_cache = [offer for offer in _offers_cache if offer.id != offer_id]
-    if len(_offers_cache) < initial_len:
-        _save_data_to_json()
-        return True
-    return False
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM offers WHERE id = %s", (offer_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+    except psycopg2.Error as e:
+        if conn: conn.rollback()
+        print(f"Database error deleting offer {offer_id}: {e}")
+        return False
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def get_distinct_cities() -> List[str]:
-    if not _offers_cache:
-        _load_data_from_json()
-    cities = set()
-    for offer in _offers_cache:
-        if offer.location and offer.location.city:
-            cities.add(offer.location.city)
-    return sorted(list(cities))
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT city FROM locations WHERE city IS NOT NULL ORDER BY city")
+    cities = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return cities
 
 def get_distinct_service_types() -> List[str]:
-    if not _offers_cache:
-        _load_data_from_json()
-    service_types = set()
-    for offer in _offers_cache:
-        if offer.type:
-            service_types.add(offer.type)
-    return sorted(list(service_types))
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT type FROM offers WHERE type IS NOT NULL ORDER BY type")
+    service_types = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return service_types
 
 def get_distinct_organisation_names() -> List[str]:
-    if not _offers_cache:
-        _load_data_from_json()
-    org_names = set()
-    for offer in _offers_cache:
-        if offer.organisation and offer.organisation.name:
-            org_names.add(offer.organisation.name)
-    return sorted(list(org_names))
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT name FROM organisations WHERE name IS NOT NULL ORDER BY name")
+    org_names = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return org_names
 
-# Helper to get all organisations and locations for dropdowns in forms
 def get_all_organisations() -> List[Organisation]:
-    if not _organisations_cache:
-        _load_data_from_json()
-    return list(_organisations_cache.values())
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM organisations ORDER BY name")
+    orgs = [Organisation(**row_dict) for row_dict in _dict_rows(cursor)]
+    conn.close()
+    return orgs
 
 def get_all_locations() -> List[Location]:
-    if not _locations_cache:
-        _load_data_from_json()
-    return list(_locations_cache.values())
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, name, address_1, city, postal_code, "
+        "ST_X(geom) AS longitude, ST_Y(geom) AS latitude, accessibility "
+        "FROM locations ORDER BY name"
+    )
+
+    locations_app_models = []
+    for row_dict in _dict_rows(cursor):
+        # accessibility should be a list from JSONB
+        if isinstance(row_dict.get('accessibility'), str): # Should not happen if JSONB used correctly
+            try:
+                row_dict['accessibility'] = json.loads(row_dict['accessibility'])
+            except json.JSONDecodeError:
+                 row_dict['accessibility'] = []
+        locations_app_models.append(Location(**row_dict))
+
+    conn.close()
+    return locations_app_models
