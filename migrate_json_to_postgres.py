@@ -183,12 +183,14 @@ def migrate_data_postgres():
                     closes_at = time.fromisoformat(sched_json["closes_at"]) if sched_json.get("closes_at") else None
                     valid_from = date.fromisoformat(sched_json["valid_from"]) if sched_json.get("valid_from") else None
                     valid_to = date.fromisoformat(sched_json["valid_to"]) if sched_json.get("valid_to") else None
-                    weekdays_list = sched_json.get("valid_for_weekdays", [])
+                    # Handle explicit nulls from JSON for valid_for_weekdays
+                    raw_weekdays = sched_json.get("valid_for_weekdays")
+                    weekdays_list = raw_weekdays if raw_weekdays is not None else []
 
                     sched_db = ServiceScheduleDB( # id auto-generated
                         offer_id=original_offer_id, opens_at=opens_at, closes_at=closes_at,
                         valid_from=valid_from, valid_to=valid_to,
-                        valid_for_weekdays=weekdays_list, # Model expects list, psycopg2 handles JSONB
+                        valid_for_weekdays=weekdays_list,
                         description=sched_json.get("description")
                     )
                     cursor.execute(

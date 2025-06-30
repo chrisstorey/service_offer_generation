@@ -32,7 +32,8 @@ echo "Running data migration..."
 python migrate_json_to_postgres.py
 echo "Data migration complete."
 
-# Now, execute the main command (passed as arguments to this script)
-# This will be `uvicorn main:app --host 0.0.0.0 --port 8000` from the Dockerfile CMD
-echo "Starting application server..."
-exec "$@"
+# Now, execute the main command.
+# We use the environment variables defined in the Dockerfile directly
+# to ensure they are expanded correctly.
+echo "Starting application server with MODULE_NAME=${MODULE_NAME}, VARIABLE_NAME=${VARIABLE_NAME}, APP_HOST=${APP_HOST}, APP_PORT=${APP_PORT}..."
+exec uvicorn "${MODULE_NAME}:${VARIABLE_NAME}" --host "${APP_HOST}" --port "${APP_PORT}"

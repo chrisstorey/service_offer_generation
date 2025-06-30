@@ -11,8 +11,8 @@ services:
       # PGDATA: /var/lib/postgresql/data/pgdata # Optional: if you want to change default PGDATA inside container
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432" # Map host port to container port if external access needed, otherwise internal only
+    # ports:
+    #   - "5432:5432" # Map host port to container port if external access needed, otherwise internal only
     restart: unless-stopped
     healthcheck: # Optional: Basic healthcheck for PostgreSQL
       test: ["CMD-SHELL", "pg_isready -U offer_user -d offers_db"]
